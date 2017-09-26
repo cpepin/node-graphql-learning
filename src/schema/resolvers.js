@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const { ObjectID } = require('mongodb');
 const { URL } = require('url');
 
+const pubsub = require('../pubsub');
 const { jwtPassword } = require('../constants');
 
 class ValidationError extends Error {
@@ -20,10 +21,34 @@ function assertValidLink ({ url }) {
   }
 }
 
+function buildFilters({ OR = [], description_contains, url_contains }) {
+  const filter = (description_contains || url_contains) ? {} : null;
+  if (description_contains) {
+    filter.description = {$regex : `.*${description_contains}.*`};
+  }
+  if (url_contains) {
+    filter.url = {$regex: `.*${url_contains}.*`};
+  }
+
+  let filters = filter ? [filter] : [];
+  for (let i = 0; i < OR.length; i++) {
+    filters = filters.concat(buildFilters(OR[i]));
+  }
+  return filters;
+}
+
 module.exports = {
   Query: {
-    allLinks: async (root, data, { mongo: { Links } }) => {
-      return await Links.find({}).toArray();
+    allLinks: async (root, { filter }, { mongo: { Links } }) => {
+      let query = filter ? { $or: buildFilters(filter) } : {};
+      const cursor = Links.find(query);
+      if (first) {
+        cursor.limit(first);
+      }
+      if (skip) {
+        cursor.skip(skip);
+      }
+      return await cursor.toArray();
     },
   },
 
@@ -32,7 +57,9 @@ module.exports = {
       assertValidLink(data);
       const newLink = Object.assign({ postedById: user && user._id }, data);
       const response = await Links.insert(newLink);
-      return Object.assign({ id: response.insertedIds[0] }, newLink);
+      newLink.id = response.insertedIds[0];
+      pubsub.publish('Link', { Link: { mutation: 'CREATED', node: newLink } });
+      return newLink;
     },
     createUser: async (root, data, { mongo: { Users } }) => {
       const bcryptedPassword = await bcrypt.hash(data.authProvider.email.password, 5);
@@ -65,6 +92,12 @@ module.exports = {
       };
       const response = await Votes.insert(newVote);
       return Object.assign({ id: response.insertedIds[0] }, newVote);
+    },
+  },
+
+  Subscription: {
+    Link: {
+      subscribe: () => pubsub.asyncIterator('Link'),
     },
   },
 
